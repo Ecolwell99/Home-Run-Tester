@@ -76,26 +76,31 @@ def _angular_diff_degrees(a: float, b: float) -> float:
 def compute_batter_power_vs_hand(batter: dict, pitcher_hand: str) -> float:
     """
     SLG split vs pitcher handedness.
-    SLG range assumed 0.150 (feeble) … 0.700 (elite power).
+    Range calibrated to realistic MLB qualifier population:
+      0.280 = weak side / platoon bat floor
+      0.620 = elite power hitter ceiling (Judge, Stanton tier)
     """
     key = "vs_LHP_slg" if pitcher_hand == "L" else "vs_RHP_slg"
     slg = batter.get(key, 0.370)
-    return _normalize(slg, 0.150, 0.700)
+    return _normalize(slg, 0.280, 0.620)
 
 
 def compute_barrel_flyball_profile(batter: dict) -> float:
     """
     Weighted composite of barrel rate, fly-ball rate, and hard-hit rate.
-    Barrel rate 0-20%, fly-ball rate 20-55%, hard-hit rate 20-55%.
+    Ranges calibrated to realistic MLB qualifier population:
+      barrel:   3% floor (weak contact) … 18% ceiling (elite barreler)
+      flyball:  25% floor (groundball-heavy) … 50% ceiling (fly-ball specialist)
+      hard_hit: 28% floor … 55% ceiling (Statcast >=95 mph EV)
     Barrel is weighted most heavily — it's the strongest HR predictor.
     """
     barrel   = batter.get("barrel_rate",   0.08)
     flyball  = batter.get("flyball_rate",  0.35)
     hard_hit = batter.get("hard_hit_rate", 0.38)
 
-    b = _normalize(barrel,   0.00, 0.20)
-    f = _normalize(flyball,  0.20, 0.55)
-    h = _normalize(hard_hit, 0.20, 0.55)
+    b = _normalize(barrel,   0.03, 0.18)
+    f = _normalize(flyball,  0.25, 0.50)
+    h = _normalize(hard_hit, 0.28, 0.55)
 
     return 0.50 * b + 0.30 * f + 0.20 * h
 
@@ -168,11 +173,13 @@ def compute_directional_wind_fit(
 def compute_pitcher_hr_vulnerability(pitcher: dict, batter_hand: str) -> float:
     """
     HR/9 allowed split vs this batter's side.
-    Range assumed 0.3 (suppressor) … 3.0 (very vulnerable).
+    Range calibrated to realistic MLB qualifier population:
+      0.50 = elite suppressor (Burnes, Alcantara tier)
+      2.20 = very hittable / HR-prone starter
     """
     key = "hr_per_9_vs_L" if batter_hand == "L" else "hr_per_9_vs_R"
     hr9 = pitcher.get(key, pitcher.get("hr_per_9", 1.2))
-    return _normalize(hr9, 0.30, 3.00)
+    return _normalize(hr9, 0.50, 2.20)
 
 
 def compute_park_factor(park: dict, batter_hand: str) -> float:
@@ -311,4 +318,3 @@ def generate_explanation(
         parts.append("Average across all factors — no standout signal")
 
     return " | ".join(parts)
-
