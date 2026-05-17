@@ -3,7 +3,7 @@ MLB Home Run Probability Screener
 Streamlit dashboard — dark mode, trading-desk style.
 """
 
-import math
+import datetime as _dt
 import streamlit as st
 import pandas as pd
 import data_loader
@@ -70,9 +70,18 @@ st.markdown("""
 # ── Load + score data ─────────────────────────────────────────────────────────
 
 @st.cache_data(ttl=300)
-def get_scored_df() -> pd.DataFrame:
-    data = data_loader.load_all()
+def get_scored_df(date: str | None = None) -> tuple[pd.DataFrame, dict]:
+    data = data_loader.load_all(date=date)
     rows = data_loader.build_rows(data)
+    meta = {
+        "game_count":   len(data.get("games", [])),
+        "batter_count": sum(
+            len(side.get("batting_order", []))
+            for gid, lu in data.get("lineups", {}).items()
+            for side in lu.values()
+        ),
+        "is_live": True,
+    }
     records = []
     for row in rows:
         sc = scoring.compute_hr_score(
@@ -113,9 +122,10 @@ def get_scored_df() -> pd.DataFrame:
             "_game":               row["game_label"],
             "_game_id":            row["game_id"],
         })
-    df = pd.DataFrame(records)
-    df = df.sort_values("HR Score", ascending=False).reset_index(drop=True)
-    return df
+    df = pd.DataFrame(records) if records else pd.DataFrame()
+    if not df.empty:
+        df = df.sort_values("HR Score", ascending=False).reset_index(drop=True)
+    return df, meta
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -148,17 +158,27 @@ def sub_gauge(val: float) -> str:
 
 # ── Sidebar filters ───────────────────────────────────────────────────────────
 
-df_all = get_scored_df()
-
 with st.sidebar:
     st.markdown('<div class="hdr">MLB HR Screener</div>', unsafe_allow_html=True)
     st.markdown('<div class="title">Filters</div>', unsafe_allow_html=True)
     st.markdown("---")
 
-    games_available = df_all["_game"].unique().tolist()
+    sel_date = st.date_input("Date", value=_dt.date.today(), label_visibility="visible")
+    sel_date_str = sel_date.isoformat()
+
+    if st.button("Refresh Data"):
+        st.cache_data.clear()
+        st.rerun()
+
+    st.markdown("---")
+
+df_all, _meta = get_scored_df(date=sel_date_str)
+
+with st.sidebar:
+    games_available = df_all["_game"].unique().tolist() if not df_all.empty else []
     sel_games = st.multiselect("Game", games_available, default=games_available)
 
-    teams_available = sorted(df_all["Team"].unique().tolist())
+    teams_available = sorted(df_all["Team"].unique().tolist()) if not df_all.empty else []
     sel_teams = st.multiselect("Team", teams_available, default=teams_available)
 
     tiers_available = ["Elite", "Strong", "Neutral", "Fade"]
@@ -167,7 +187,7 @@ with st.sidebar:
     sides_available = ["L", "R", "S"]
     sel_sides = st.multiselect("Batter Side", sides_available, default=["L", "R", "S"])
 
-    parks_available = sorted(df_all["Park"].unique().tolist())
+    parks_available = sorted(df_all["Park"].unique().tolist()) if not df_all.empty else []
     sel_parks = st.multiselect("Park", parks_available, default=parks_available)
 
     min_score, max_score = st.slider("HR Score Range", 0, 100, (0, 100))
@@ -186,21 +206,26 @@ with st.sidebar:
 """, unsafe_allow_html=True)
 
     st.markdown("---")
-    if st.button("Refresh Data"):
-        st.cache_data.clear()
-        st.rerun()
+    st.markdown(
+        f'<div style="font-size:10px; color:#555;">Live data · {_meta["game_count"]} games · '
+        f'{_meta["batter_count"]} lineup slots</div>',
+        unsafe_allow_html=True,
+    )
 
 
 # ── Apply filters ─────────────────────────────────────────────────────────────
 
-df = df_all[
-    df_all["_game"].isin(sel_games) &
-    df_all["Team"].isin(sel_teams) &
-    df_all["Tier"].isin(sel_tiers) &
-    df_all["Side"].isin(sel_sides) &
-    df_all["Park"].isin(sel_parks) &
-    df_all["HR Score"].between(min_score, max_score)
-].reset_index(drop=True)
+if df_all.empty:
+    df = df_all
+else:
+    df = df_all[
+        df_all["_game"].isin(sel_games) &
+        df_all["Team"].isin(sel_teams) &
+        df_all["Tier"].isin(sel_tiers) &
+        df_all["Side"].isin(sel_sides) &
+        df_all["Park"].isin(sel_parks) &
+        df_all["HR Score"].between(min_score, max_score)
+    ].reset_index(drop=True)
 
 
 # ── Header ────────────────────────────────────────────────────────────────────
@@ -209,23 +234,34 @@ st.markdown('<div class="hdr">MLB</div>', unsafe_allow_html=True)
 st.markdown('<div class="title">Home Run Probability Screener</div>', unsafe_allow_html=True)
 st.markdown('<div class="subtitle">Directional wind fit · Split power · Park factors · Pitcher vulnerability</div>', unsafe_allow_html=True)
 
+# Lineup availability notice
+if _meta["game_count"] > 0 and _meta["batter_count"] == 0:
+    st.warning(
+        "Lineups not yet posted for today's games. "
+        "Batting order rows will populate ~60–90 min before first pitch. "
+        "Pitcher matchups are shown where probable starters are available.",
+        icon="⏳",
+    )
+elif df_all.empty:
+    st.info(f"No games found for {sel_date_str}. Try a different date.", icon="📅")
+
 # Summary metrics row
 c1, c2, c3, c4, c5 = st.columns(5)
-elite_n  = len(df[df["Tier"] == "Elite"])
-strong_n = len(df[df["Tier"] == "Strong"])
-avg_score = df["HR Score"].mean() if len(df) else 0.0
+elite_n   = len(df[df["Tier"] == "Elite"])   if not df.empty else 0
+strong_n  = len(df[df["Tier"] == "Strong"])  if not df.empty else 0
+avg_score = df["HR Score"].mean()             if not df.empty else 0.0
 with c1: st.metric("Total Batters", len(df))
 with c2: st.metric("Elite",  elite_n)
 with c3: st.metric("Strong", strong_n)
 with c4: st.metric("Avg HR Score", f"{avg_score:.1f}")
-with c5: st.metric("Games", len(sel_games))
+with c5: st.metric("Games", _meta["game_count"])
 
 st.markdown("---")
 
 
 # ── View toggle ───────────────────────────────────────────────────────────────
 
-view = st.radio("View", ["Ranked Cards", "Raw Table"], horizontal=True, label_visibility="collapsed")
+view = st.radio("View", ["Ranked Cards", "Raw Table", "Debug"], horizontal=True, label_visibility="collapsed")
 st.markdown("")
 
 
@@ -288,31 +324,33 @@ if view == "Ranked Cards":
 # ── Raw Table view ────────────────────────────────────────────────────────────
 
 else:
-    display_cols = [
-        "Player", "Team", "Opp", "Order", "Side", "Bats",
-        "Pitcher", "P Hand", "Park", "Wind", "Temp",
-        "HR Score", "Split Power", "Barrel/FB", "Wind Fit",
-        "Park Boost", "Pitcher Vuln", "Carry", "Tier",
-    ]
-    st.dataframe(
-        df[display_cols].style
-            .background_gradient(subset=["HR Score"], cmap="RdYlGn", vmin=0, vmax=100)
-            .background_gradient(subset=["Wind Fit"], cmap="RdYlGn", vmin=0, vmax=100)
-            .format({
-                "HR Score":    "{:.1f}",
-                "Split Power": "{:.1f}",
-                "Barrel/FB":   "{:.1f}",
-                "Wind Fit":    "{:.1f}",
-                "Park Boost":  "{:.1f}",
-                "Pitcher Vuln":"{:.1f}",
-                "Carry":       "{:.1f}",
-            }),
-        use_container_width=True,
-        height=620,
-    )
-    st.markdown("---")
-    st.markdown("**Explanation**")
-    if not df.empty:
+    if df.empty:
+        st.warning("No batters match the current filters.")
+    else:
+        display_cols = [
+            "Player", "Team", "Opp", "Order", "Side", "Bats",
+            "Pitcher", "P Hand", "Park", "Wind", "Temp",
+            "HR Score", "Split Power", "Barrel/FB", "Wind Fit",
+            "Park Boost", "Pitcher Vuln", "Carry", "Tier",
+        ]
+        st.dataframe(
+            df[display_cols].style
+                .background_gradient(subset=["HR Score"], cmap="RdYlGn", vmin=0, vmax=100)
+                .background_gradient(subset=["Wind Fit"], cmap="RdYlGn", vmin=0, vmax=100)
+                .format({
+                    "HR Score":    "{:.1f}",
+                    "Split Power": "{:.1f}",
+                    "Barrel/FB":   "{:.1f}",
+                    "Wind Fit":    "{:.1f}",
+                    "Park Boost":  "{:.1f}",
+                    "Pitcher Vuln":"{:.1f}",
+                    "Carry":       "{:.1f}",
+                }),
+            use_container_width=True,
+            height=620,
+        )
+        st.markdown("---")
+        st.markdown("**Explanation**")
         sel_name = st.selectbox("Select player", df["Player"].tolist(), label_visibility="collapsed")
         if sel_name:
             row_exp = df[df["Player"] == sel_name].iloc[0]
@@ -320,3 +358,88 @@ else:
             for p in parts:
                 st.markdown(f"- {p}")
 
+
+# ── Debug view ────────────────────────────────────────────────────────────────
+
+elif view == "Debug":
+    import datetime as _dt2
+    st.markdown("### Data Pipeline Diagnostics")
+
+    # ── FanGraphs batting ──
+    st.markdown("#### 1. FanGraphs Batting Stats")
+    fg = data_loader._fetch_fg_batting()
+    if fg.empty:
+        st.error("FAILED — empty DataFrame. pybaseball may not be installed or FanGraphs is unreachable.")
+    else:
+        st.success(f"OK — {len(fg)} rows")
+        st.write("Columns:", list(fg.columns))
+        sample_cols = [c for c in ["Name", "Team", "SLG", "Bat", "bat", "HR", "PA"] if c in fg.columns]
+        st.dataframe(fg[sample_cols].head(15))
+
+    # ── Savant batted-ball ──
+    st.markdown("#### 2. Savant Batted-Ball CSV")
+    sv = data_loader._fetch_savant_batted_ball()
+    if sv.empty:
+        st.error("FAILED — empty DataFrame.")
+    else:
+        st.success(f"OK — {len(sv)} rows")
+        st.write("Columns:", list(sv.columns))
+        st.dataframe(sv.head(5))
+
+    # ── FanGraphs pitching ──
+    st.markdown("#### 3. FanGraphs Pitching Stats")
+    try:
+        from pybaseball import pitching_stats
+        pf = pitching_stats(_dt2.date.today().year, qual=10)
+        if pf is None or pf.empty:
+            st.error("FAILED — empty")
+        else:
+            st.success(f"OK — {len(pf)} rows")
+            sample_cols = [c for c in ["Name", "Team", "HR/9", "throws", "Throws"] if c in pf.columns]
+            st.dataframe(pf[sample_cols].head(15))
+    except Exception as e:
+        st.error(f"FAILED — {e}")
+
+    # ── Name key match rate ──
+    st.markdown("#### 4. Name Key Match Rate (FanGraphs ↔ MLB Lineup API)")
+    if not fg.empty:
+        fg_keys = set(data_loader._player_key(str(r.get("Name", ""))) for _, r in fg.iterrows())
+        lineup_keys = set()
+        for lu in data_loader.load_all(date=sel_date_str)["lineups"].values():
+            for side in lu.values():
+                for k, _ in side.get("batting_order", []):
+                    lineup_keys.add(k)
+
+        matched   = lineup_keys & fg_keys
+        unmatched = lineup_keys - fg_keys
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Lineup keys", len(lineup_keys))
+        c2.metric("Matched to FG", len(matched))
+        c3.metric("Unmatched (stubs)", len(unmatched))
+
+        if unmatched:
+            st.markdown("**Unmatched lineup keys** (these players are using stub data):")
+            st.write(sorted(unmatched))
+            st.markdown("**Sample FanGraphs keys** (for comparison):")
+            st.write(sorted(fg_keys)[:20])
+    else:
+        st.warning("Skipped — FanGraphs data unavailable.")
+
+    # ── Score breakdown for first real batter ──
+    st.markdown("#### 5. Score Breakdown — First Batter in Results")
+    if not df_all.empty:
+        r = df_all.iloc[0]
+        st.write({
+            "Player":       r["Player"],
+            "vs_RHP_slg":   data_loader._BATTER_REGISTRY.get(
+                                data_loader._player_key(r["Player"]), {}
+                            ).get("vs_RHP_slg", "not in registry — check batters dict"),
+            "Split Power":  r["Split Power"],
+            "Barrel/FB":    r["Barrel/FB"],
+            "Wind Fit":     r["Wind Fit"],
+            "Park Boost":   r["Park Boost"],
+            "Pitcher Vuln": r["Pitcher Vuln"],
+            "Carry":        r["Carry"],
+            "HR Score":     r["HR Score"],
+        })
