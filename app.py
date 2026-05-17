@@ -365,20 +365,22 @@ elif view == "Debug":
     import datetime as _dt2
     st.markdown("### Data Pipeline Diagnostics")
 
-    # ── FanGraphs batting ──
-    st.markdown("#### 1. FanGraphs Batting Stats")
+    # ── Savant expected stats (SLG) ──
+    st.markdown("#### 1. Savant Expected Stats (SLG source)")
     fg = data_loader._fetch_fg_batting()
     if fg.empty:
-        st.error("FAILED — empty DataFrame. pybaseball may not be installed or FanGraphs is unreachable.")
+        st.error("FAILED — empty DataFrame.")
     else:
         st.success(f"OK — {len(fg)} rows")
         st.write("Columns:", list(fg.columns))
-        sample_cols = [c for c in ["Name", "Team", "SLG", "Bat", "bat", "HR", "PA"] if c in fg.columns]
-        st.dataframe(fg[sample_cols].head(15))
+        name_col = next((c for c in ["last_name, first_name","player_name","name"] if c in fg.columns), None)
+        slg_col  = next((c for c in ["slg","SLG","slg_percent"] if c in fg.columns), None)
+        show = [c for c in [name_col, slg_col, "pa"] if c]
+        st.dataframe(fg[show].head(15) if show else fg.head(15))
 
     # ── Savant batted-ball ──
-    st.markdown("#### 2. Savant Batted-Ball CSV")
-    sv = data_loader._fetch_savant_batted_ball()
+    st.markdown("#### 2. Savant Batted-Ball CSV (barrel/spray source)")
+    sv = data_loader._fetch_savant_batted_ball_df()
     if sv.empty:
         st.error("FAILED — empty DataFrame.")
     else:
@@ -386,17 +388,17 @@ elif view == "Debug":
         st.write("Columns:", list(sv.columns))
         st.dataframe(sv.head(5))
 
-    # ── FanGraphs pitching ──
-    st.markdown("#### 3. FanGraphs Pitching Stats")
+    # ── MLB pitcher stats ──
+    st.markdown("#### 3. MLB Stats API — Pitcher HR/9")
     try:
-        from pybaseball import pitching_stats
-        pf = pitching_stats(_dt2.date.today().year, qual=10)
-        if pf is None or pf.empty:
+        pm = data_loader._fetch_pitcher_stats(_dt2.date.today().year)
+        if not pm:
             st.error("FAILED — empty")
         else:
-            st.success(f"OK — {len(pf)} rows")
-            sample_cols = [c for c in ["Name", "Team", "HR/9", "throws", "Throws"] if c in pf.columns]
-            st.dataframe(pf[sample_cols].head(15))
+            st.success(f"OK — {len(pm)} pitchers")
+            sample = [{k: v for k, v in p.items() if k != "_ip"}
+                      for p in list(pm.values())[:10]]
+            st.dataframe(pd.DataFrame(sample))
     except Exception as e:
         st.error(f"FAILED — {e}")
 
