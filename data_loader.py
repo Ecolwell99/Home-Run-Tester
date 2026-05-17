@@ -293,11 +293,11 @@ def _build_batter_dict(df: pd.DataFrame) -> dict:
                 "name":          _short_name(name),
                 "team":          str(row.get("team_name", "MLB")),
                 "batter_hand":   "R",          # not in this endpoint; filled later
-                "vs_RHP_slg":    0.400,         # placeholder until split fetch works
-                "vs_LHP_slg":    0.400,
-                "barrel_rate":   float(row.get("brl_pa",       0.08) or 0.08) / 100,
-                "flyball_rate":  0.36,           # not in exit-velo endpoint
-                "hard_hit_rate": float(row.get("ev95percent",  38)   or 38)   / 100,
+                "vs_RHP_slg":    0.450,        # midpoint placeholder until split fetch works
+                "vs_LHP_slg":    0.450,
+                "barrel_rate":   float(row.get("brl_pa",       10.5) or 10.5) / 100,
+                "flyball_rate":  0.375,        # midpoint placeholder
+                "hard_hit_rate": float(row.get("ev95percent",  41.5) or 41.5) / 100,
                 "pull_rate":     0.40,
                 "oppo_rate":     0.24,
                 "hr_rate":       0.035,
@@ -319,13 +319,13 @@ def _build_pitcher_dict(df: pd.DataFrame) -> dict:
         try:
             name = str(row.get("Name", ""))
             key  = _player_key(name)
-            hr9  = float(row.get("HR/9", 1.2) or 1.2)
+            hr9  = float(row.get("HR/9", 1.35) or 1.35)  # midpoint of 0.50–2.20
             out[key] = {
                 "pitcher_id":     key,
                 "name":           _short_name(name),
                 "hand":           "R",          # not in FG table; filled from roster
                 "hr_per_9":       hr9,
-                "hr_per_9_vs_L":  hr9 * 1.05,  # no split available without extra fetch
+                "hr_per_9_vs_L":  hr9 * 1.05,
                 "hr_per_9_vs_R":  hr9 * 0.95,
             }
         except Exception:
@@ -412,9 +412,9 @@ def _ensure_batter_stub(key: str, name: str, team: str, hand: str) -> None:
         _BATTER_REGISTRY[key] = {
             "player_id":    key,    "name":          _short_name(name),
             "team":         team,   "batter_hand":   hand,
-            "vs_RHP_slg":   0.370,  "vs_LHP_slg":    0.370,
-            "barrel_rate":  0.08,   "flyball_rate":   0.35,
-            "hard_hit_rate":0.38,   "pull_rate":      0.40,
+            "vs_RHP_slg":   0.450,  "vs_LHP_slg":    0.450,  # midpoint of 0.280–0.620
+            "barrel_rate":  0.105,  "flyball_rate":   0.375,  # midpoint of respective ranges
+            "hard_hit_rate":0.415,  "pull_rate":      0.40,
             "oppo_rate":    0.24,   "hr_rate":        0.030,
         }
 
@@ -424,7 +424,7 @@ def _ensure_pitcher_stub(key: str, name: str, hand: str) -> None:
         _PITCHER_REGISTRY[key] = {
             "pitcher_id":    key,   "name":          _short_name(name),
             "hand":          hand,
-            "hr_per_9":      1.20,  "hr_per_9_vs_L": 1.26,  "hr_per_9_vs_R": 1.14,
+            "hr_per_9":      1.35,  "hr_per_9_vs_L": 1.42,  "hr_per_9_vs_R": 1.28,  # midpoint of 0.50–2.20
         }
 
 
