@@ -3,20 +3,21 @@ Data loader — live API implementation.
 
 Sources (all free, no auth):
   Schedule + lineups  : MLB Stats API  (statsapi.mlb.com)
-  Batter splits       : Baseball Savant batted-ball leaderboard CSV (bulk, one call per hand)
-  Pitcher splits      : Baseball Savant pitcher leaderboard CSV (bulk, one call per hand)
+  Batter SLG          : pybaseball batting_stats() → FanGraphs season totals
+  Batter profile      : Baseball Savant batted-ball leaderboard CSV
+                        (barrel%, FB%, pull%, oppo%)
+  Pitcher HR/9        : pybaseball pitching_stats() → FanGraphs season totals
   Weather             : wttr.in JSON API (lat/lon per stadium)
   Park factors        : stadiums.py static registry
 
-Stat fetch strategy — two bulk CSV calls get all qualified batters in one shot:
-  Savant batted-ball leaderboard vs RHP  → SLG, barrel%, FB%, pull%, oppo%, HH%
-  Savant batted-ball leaderboard vs LHP  → same
-  Savant pitcher leaderboard vs RHB/LHB → HR/9 by batter side
-This avoids per-player loops and rate-limiting.
-
-Fallback chain:
-  1. Try live API / CSV call
-  2. On any error, log a warning and use midpoint stub so app stays runnable
+Hand-split approximation:
+  True vs-LHP/vs-RHP splits require per-player API calls (too slow for a full slate).
+  Instead we use season-total SLG/HR9 and apply empirical MLB platoon multipliers:
+    LHH  vs RHP: ×1.08  vs LHP: ×0.87
+    RHH  vs LHP: ×1.06  vs RHP: ×0.96
+    SHH  both  : ×1.00
+  This preserves real player differentiation (Judge .600 vs bench bat .320)
+  while correctly ranking LHH vs RHP higher than LHH vs LHP.
 """
 
 from __future__ import annotations
@@ -24,6 +25,7 @@ from __future__ import annotations
 import datetime
 import logging
 import time
+from io import StringIO
 from typing import Any
 
 import requests
@@ -34,16 +36,24 @@ import stadiums as _stadiums
 
 log = logging.getLogger(__name__)
 
-MLB_SCHEDULE_URL = "https://statsapi.mlb.com/api/v1/schedule"
-MLB_GAME_URL     = "https://statsapi.mlb.com/api/v1.1/game/{gamePk}/feed/live"
-WTTR_URL         = "https://wttr.in/{lat},{lon}?format=j1"
+MLB_SCHEDULE_URL   = "https://statsapi.mlb.com/api/v1/schedule"
+MLB_GAME_URL       = "https://statsapi.mlb.com/api/v1.1/game/{gamePk}/feed/live"
+WTTR_URL           = "https://wttr.in/{lat},{lon}?format=j1"
+SAVANT_BATBALL_URL = "https://baseballsavant.mlb.com/leaderboard/batted-ball"
 
-# Savant leaderboard CSV base — returns all qualified players in one call
-SAVANT_BATTER_URL  = "https://baseballsavant.mlb.com/leaderboard/batted-ball"
-SAVANT_PITCHER_URL = "https://baseballsavant.mlb.com/statcast_leaderboard"
+_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; mlb-hr-screener/1.0)"}
 
-_SAVANT_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; mlb-hr-screener/1.0)"
+# Platoon SLG multipliers — empirical MLB averages
+_PLATOON_SLG = {
+    "L": {"R": 1.08, "L": 0.87},   # LHH vs RHP gets a boost, vs LHP a penalty
+    "R": {"R": 0.96, "L": 1.06},   # RHH vs LHP gets a boost, vs RHP a slight penalty
+    "S": {"R": 1.00, "L": 1.00},
+}
+
+# Platoon HR/9 multipliers for pitchers
+_PLATOON_HR9 = {
+    "L": {"R": 1.12, "L": 0.82},   # LHP allows more HRs to RHH, fewer to LHH
+    "R": {"R": 0.92, "L": 1.10},   # RHP allows more HRs to LHH, fewer to RHH
 }
 
 
@@ -60,22 +70,18 @@ def load_all(date: str | None = None) -> dict[str, Any]:
 
     games, lineups, park_map = _process_schedule(games_raw)
 
-    # Bulk stat fetches — one DataFrame per split side
-    batter_vs_rhp, batter_vs_lhp = _fetch_batter_splits()
-    pitcher_vs_rhb, pitcher_vs_lhb = _fetch_pitcher_splits()
+    batters  = _fetch_all_batter_stats()
+    pitchers = _fetch_all_pitcher_stats()
 
-    batters  = _build_batter_dict(batter_vs_rhp, batter_vs_lhp)
-    pitchers = _build_pitcher_dict(pitcher_vs_rhb, pitcher_vs_lhb)
-
-    # Sample data fills known players not yet in Savant (injured, minor league callups)
+    # Sample data fills named players not yet qualified in Savant/FG (callups, etc.)
     for k, v in _sd.BATTERS.items():
         batters.setdefault(k, v)
     for k, v in _sd.PITCHERS.items():
         pitchers.setdefault(k, v)
 
     weather = _fetch_all_weather(games)
-    parks   = {abbr: _stadiums.STADIUMS[abbr] for abbr in park_map.values()
-               if abbr in _stadiums.STADIUMS}
+    parks   = {abbr: _stadiums.STADIUMS[abbr]
+               for abbr in park_map.values() if abbr in _stadiums.STADIUMS}
 
     return dict(games=games, lineups=lineups, pitchers=pitchers,
                 parks=parks, weather=weather, batters=batters)
@@ -84,11 +90,7 @@ def load_all(date: str | None = None) -> dict[str, Any]:
 # ── Schedule + lineups ────────────────────────────────────────────────────────
 
 def _fetch_schedule(date: str) -> list[dict]:
-    params = {
-        "sportId": 1,
-        "date":    date,
-        "hydrate": "team,venue,probablePitcher(note)",
-    }
+    params = {"sportId": 1, "date": date, "hydrate": "team,venue,probablePitcher(note)"}
     try:
         r = requests.get(MLB_SCHEDULE_URL, params=params, timeout=10)
         r.raise_for_status()
@@ -102,44 +104,36 @@ def _fetch_schedule(date: str) -> list[dict]:
 def _process_schedule(games_raw: list[dict]) -> tuple[list[dict], dict, dict[str, str]]:
     games, lineups, park_map = [], {}, {}
     for g in games_raw:
-        detail = g.get("status", {}).get("detailedState", "")
-        if detail in ("Postponed", "Cancelled", "Suspended"):
+        if g.get("status", {}).get("detailedState") in ("Postponed", "Cancelled", "Suspended"):
             continue
-
         gid       = str(g["gamePk"])
         away_abbr = g["teams"]["away"]["team"].get("abbreviation", "UNK")
         home_abbr = g["teams"]["home"]["team"].get("abbreviation", "UNK")
         venue     = g.get("venue", {}).get("name", "Unknown Park")
-        game_time = g.get("gameDate", "TBD")
-
         games.append({
             "game_id":  gid,
             "away":     away_abbr,
             "home":     home_abbr,
             "park_id":  home_abbr,
-            "time":     game_time,
+            "time":     g.get("gameDate", "TBD"),
             "label":    f"{away_abbr} @ {home_abbr} — {venue}",
         })
         park_map[gid] = home_abbr
         lineups[gid]  = _fetch_lineup(gid, g, away_abbr, home_abbr)
-
     return games, lineups, park_map
 
 
 def _fetch_lineup(game_pk: str, game_meta: dict, away_abbr: str, home_abbr: str) -> dict:
-    url = MLB_GAME_URL.format(gamePk=game_pk)
     try:
-        r = requests.get(url, timeout=10)
+        r = requests.get(MLB_GAME_URL.format(gamePk=game_pk), timeout=10)
         r.raise_for_status()
         feed = r.json()
     except Exception as exc:
-        log.warning("Live feed fetch failed for %s: %s", game_pk, exc)
+        log.warning("Live feed failed for %s: %s", game_pk, exc)
         return _probable_only_lineup(game_meta, away_abbr, home_abbr)
 
-    game_data = feed.get("gameData", {})
-    live_data = feed.get("liveData", {})
-    players   = game_data.get("players", {})
-    teams_box = live_data.get("boxscore", {}).get("teams", {})
+    players   = feed.get("gameData", {}).get("players", {})
+    teams_box = feed.get("liveData", {}).get("boxscore", {}).get("teams", {})
 
     result = {}
     for side, abbr in [("away", away_abbr), ("home", home_abbr)]:
@@ -156,21 +150,17 @@ def _fetch_lineup(game_pk: str, game_meta: dict, away_abbr: str, home_abbr: str)
             batting_order.append((key, pos))
             _ensure_batter_stub(key, name, abbr, hand)
 
-        pitcher_id_mlb = (pitchers_ids[0] if pitchers_ids
-                          else game_data.get("probablePitchers", {}).get(side, {}).get("id"))
-
+        prob_side = feed.get("gameData", {}).get("probablePitchers", {}).get(side, {})
+        pid_mlb   = pitchers_ids[0] if pitchers_ids else prob_side.get("id")
         pitcher_key = "unknown"
-        if pitcher_id_mlb:
-            pdata       = players.get(f"ID{pitcher_id_mlb}", {})
-            pname       = pdata.get("fullName", str(pitcher_id_mlb))
+        if pid_mlb:
+            pdata       = players.get(f"ID{pid_mlb}", {})
+            pname       = pdata.get("fullName", str(pid_mlb))
             phand       = pdata.get("pitchHand", {}).get("code", "R")
             pitcher_key = _player_key(pname)
             _ensure_pitcher_stub(pitcher_key, pname, phand)
 
-        result[abbr] = {
-            "pitcher_id":    pitcher_key,
-            "batting_order": batting_order or [],
-        }
+        result[abbr] = {"pitcher_id": pitcher_key, "batting_order": batting_order}
     return result
 
 
@@ -184,249 +174,160 @@ def _probable_only_lineup(game_meta: dict, away_abbr: str, home_abbr: str) -> di
     return result
 
 
-# ── Savant bulk stat fetches ──────────────────────────────────────────────────
+# ── Batter stats ──────────────────────────────────────────────────────────────
 
-def _fetch_batter_splits() -> tuple[pd.DataFrame, pd.DataFrame]:
+def _fetch_all_batter_stats() -> dict:
     """
-    Two calls to Savant batted-ball leaderboard — one vs RHP, one vs LHP.
-    Returns (vs_rhp_df, vs_lhp_df). Both empty on failure.
-
-    Key columns returned by Savant batted-ball CSV:
-      player_id, last_name, first_name, player_name,
-      b_ab, b_home_run, b_k_percent, b_bb_percent,
-      slg_percent, on_base_plus_slg,
-      barrel_batted_rate (barrels/BBE),
-      hard_hit_percent (EV >= 95 mph),
-      anglesweetspotpercent (sweet spot %),
-      pull_percent, straightaway_percent, opposite_percent
+    Two sources merged per batter:
+      1. pybaseball batting_stats() → FanGraphs: SLG, batter hand
+      2. Savant batted-ball CSV → barrel%, FB%, pull%, oppo%
     """
-    year = datetime.date.today().year
-    vs_rhp = _savant_batted_ball_csv(year, pitcher_hand="R")
-    time.sleep(1.0)
-    vs_lhp = _savant_batted_ball_csv(year, pitcher_hand="L")
-    return vs_rhp, vs_lhp
+    fg_df     = _fetch_fg_batting()
+    savant_df = _fetch_savant_batted_ball()
+    return _merge_batter_stats(fg_df, savant_df)
 
 
-def _savant_batted_ball_csv(year: int, pitcher_hand: str) -> pd.DataFrame:
-    """
-    Savant batted-ball leaderboard CSV — all qualified batters, filtered by pitcher hand.
-    min_pa=25 keeps callups with small samples; app will still rank them lower
-    because their raw stats won't be elite.
-    """
-    params = {
-        "csv":           "true",
-        "type":          "batter",
-        "year":          year,
-        "min_pa":        25,
-        "pitcher_hand":  pitcher_hand,   # "R" or "L"
-    }
+def _fetch_fg_batting() -> pd.DataFrame:
     try:
-        r = requests.get(
-            SAVANT_BATTER_URL,
-            params=params,
-            headers=_SAVANT_HEADERS,
-            timeout=20,
-        )
-        r.raise_for_status()
-        from io import StringIO
-        df = pd.read_csv(StringIO(r.text))
-        log.info("Savant batter vs %sHP: %d rows", pitcher_hand, len(df))
-        return df
+        from pybaseball import batting_stats
+        df = batting_stats(datetime.date.today().year, qual=50)
+        log.info("FanGraphs batting: %d rows", len(df))
+        return df if df is not None else pd.DataFrame()
     except Exception as exc:
-        log.warning("Savant batter vs %sHP fetch failed: %s", pitcher_hand, exc)
+        log.warning("FanGraphs batting fetch failed: %s", exc)
         return pd.DataFrame()
 
 
-def _fetch_pitcher_splits() -> tuple[pd.DataFrame, pd.DataFrame]:
+def _fetch_savant_batted_ball() -> pd.DataFrame:
     """
-    Two calls to Savant pitcher leaderboard — one vs RHB, one vs LHB.
-    Returns (vs_rhb_df, vs_lhb_df).
+    Savant batted-ball leaderboard — all batters, season totals (no hand filter).
+    Confirmed columns: id, name, fb_rate, pull_rate, straight_rate, oppo_rate,
+                       air_rate, gb_rate, ld_rate, pu_rate
     """
-    year = datetime.date.today().year
-    vs_rhb = _savant_pitcher_csv(year, batter_hand="R")
-    time.sleep(1.0)
-    vs_lhb = _savant_pitcher_csv(year, batter_hand="L")
-    return vs_rhb, vs_lhb
-
-
-def _savant_pitcher_csv(year: int, batter_hand: str) -> pd.DataFrame:
-    """
-    Savant pitcher leaderboard CSV filtered by batter hand.
-    Key columns: player_id, player_name, b_home_run, p_formatted_ip,
-                 slg_percent, hard_hit_percent, barrel_batted_rate
-    """
-    params = {
-        "csv":          "true",
-        "type":         "pitcher",
-        "year":         year,
-        "min_pa":       20,
-        "batter_hand":  batter_hand,   # "R" or "L"
-    }
+    params = {"csv": "true", "year": datetime.date.today().year, "min_bbe": 20}
     try:
-        r = requests.get(
-            SAVANT_PITCHER_URL,
-            params=params,
-            headers=_SAVANT_HEADERS,
-            timeout=20,
-        )
+        r = requests.get(SAVANT_BATBALL_URL, params=params, headers=_HEADERS, timeout=20)
         r.raise_for_status()
-        from io import StringIO
         df = pd.read_csv(StringIO(r.text))
-        log.info("Savant pitcher vs %sHB: %d rows", batter_hand, len(df))
-        return df
+        log.info("Savant batted-ball: %d rows, cols: %s", len(df), list(df.columns)[:8])
+        return df if df is not None else pd.DataFrame()
     except Exception as exc:
-        log.warning("Savant pitcher vs %sHB fetch failed: %s", batter_hand, exc)
+        log.warning("Savant batted-ball fetch failed: %s", exc)
         return pd.DataFrame()
 
 
-# ── Stat dict builders ────────────────────────────────────────────────────────
-
-# Column name candidates — Savant occasionally renames columns across seasons
-_SLG_COLS       = ["slg_percent", "slg"]
-_BARREL_COLS    = ["barrel_batted_rate", "brl_pa", "brl_percent"]
-_HARD_HIT_COLS  = ["hard_hit_percent", "ev95percent"]
-_FB_COLS        = ["flyballs_percent", "fb_percent", "anglesweetspotpercent"]
-_PULL_COLS      = ["pull_percent", "pull_rate"]
-_OPPO_COLS      = ["opposite_percent", "oppo_percent"]
-_HR_COLS        = ["b_home_run", "home_run", "hr"]
-_IP_COLS        = ["p_formatted_ip", "ip", "IP"]
-_NAME_COLS      = ["player_name", "name", "Name"]
-_ID_COLS        = ["player_id", "batter", "pitcher", "mlb_id"]
-
-
-def _col(row, candidates: list[str], default):
-    for c in candidates:
-        if c in row.index and pd.notna(row[c]):
-            try:
-                return float(row[c])
-            except (ValueError, TypeError):
-                continue
-    return default
-
-
-def _name_from_row(row) -> str:
-    for c in _NAME_COLS:
-        if c in row.index and pd.notna(row[c]):
-            return str(row[c]).strip()
-    # fallback: last_name, first_name columns
-    last  = str(row.get("last_name",  "")).strip()
-    first = str(row.get("first_name", "")).strip()
-    if last:
-        return f"{first} {last}".strip()
-    return "Unknown"
-
-
-def _ip_to_float(ip_str) -> float:
-    """'15.1' → 15.333, '15' → 15.0"""
-    try:
-        s = str(ip_str).strip()
-        if "." in s:
-            whole, frac = s.split(".", 1)
-            return float(whole) + float(frac) / 3
-        return float(s)
-    except Exception:
-        return 1.0
-
-
-def _build_batter_dict(
-    vs_rhp: pd.DataFrame,
-    vs_lhp: pd.DataFrame,
-) -> dict:
+def _merge_batter_stats(fg: pd.DataFrame, savant: pd.DataFrame) -> dict:
     """
-    Merge vs-RHP and vs-LHP DataFrames into per-batter dicts.
-    For each batter, use the split SLG directly for vs_RHP_slg / vs_LHP_slg.
-    Barrel, flyball, hard-hit, pull, oppo: average of both splits (full-season profile).
+    Build per-batter dicts. FanGraphs is the primary source for SLG and hand.
+    Savant provides the batted-ball profile. Merged on normalized player name key.
     """
+    # Build Savant lookup: name_key → row
+    sav_lookup: dict[str, Any] = {}
+    if not savant.empty:
+        for _, row in savant.iterrows():
+            name = str(row.get("name", "")).strip()
+            if name:
+                sav_lookup[_player_key(name)] = row
+
     out: dict[str, dict] = {}
 
-    def _ingest(df: pd.DataFrame, slg_key: str) -> None:
-        if df.empty:
-            return
-        for _, row in df.iterrows():
-            name = _name_from_row(row)
-            key  = _player_key(name)
+    if not fg.empty:
+        for _, row in fg.iterrows():
+            try:
+                name = str(row.get("Name", "")).strip()
+                if not name:
+                    continue
+                key  = _player_key(name)
+                hand = str(row.get("Bat", row.get("bat", "R"))).strip().upper()
+                if hand not in ("L", "R", "S"):
+                    hand = "R"
 
-            slg      = _col(row, _SLG_COLS,      0.450) / (1 if _col(row, _SLG_COLS, 0.450) <= 1 else 1000)
-            barrel   = _col(row, _BARREL_COLS,   10.5)
-            hard_hit = _col(row, _HARD_HIT_COLS, 41.5)
-            flyball  = _col(row, _FB_COLS,        37.5)
-            pull     = _col(row, _PULL_COLS,      40.0)
-            oppo     = _col(row, _OPPO_COLS,      24.0)
+                slg  = float(row.get("SLG", 0.450) or 0.450)
 
-            # Savant reports rates as 0–100; normalise to 0–1
-            barrel   = barrel   / 100 if barrel   > 1 else barrel
-            hard_hit = hard_hit / 100 if hard_hit > 1 else hard_hit
-            flyball  = flyball  / 100 if flyball  > 1 else flyball
-            pull     = pull     / 100 if pull     > 1 else pull
-            oppo     = oppo     / 100 if oppo     > 1 else oppo
-            slg      = slg      / 1000 if slg     > 1 else slg  # sometimes stored as integer
+                # Apply platoon multipliers to get split SLG
+                plat = _PLATOON_SLG.get(hand, _PLATOON_SLG["R"])
+                vs_rhp_slg = round(slg * plat["R"], 3)
+                vs_lhp_slg = round(slg * plat["L"], 3)
 
-            if key not in out:
+                # Pull batted-ball profile from Savant if available
+                srow = sav_lookup.get(key, {})
+                barrel   = _safe_float(srow, ["brl_pa", "brl_percent", "barrel_batted_rate"], 10.5) / 100
+                flyball  = _safe_float(srow, ["fb_rate"], 37.5)
+                hard_hit = _safe_float(srow, ["ev95percent", "hard_hit_percent"], 41.5)
+                pull     = _safe_float(srow, ["pull_rate"], 40.0)
+                oppo     = _safe_float(srow, ["oppo_rate"], 24.0)
+
+                # Savant fb_rate, pull_rate, oppo_rate are already 0–1
+                # ev95percent is 0–100; normalise
+                hard_hit = hard_hit / 100 if hard_hit > 1 else hard_hit
+                flyball  = flyball  / 100 if flyball  > 1 else flyball
+                pull     = pull     / 100 if pull     > 1 else pull
+                oppo     = oppo     / 100 if oppo     > 1 else oppo
+
                 out[key] = {
                     "player_id":     key,
                     "name":          _short_name(name),
-                    "team":          str(row.get("team_name", row.get("team", "MLB"))),
-                    "batter_hand":   str(row.get("stand", row.get("b_stand", "R"))),
-                    "vs_RHP_slg":    0.450,
-                    "vs_LHP_slg":    0.450,
+                    "team":          str(row.get("Team", "MLB")),
+                    "batter_hand":   hand,
+                    "vs_RHP_slg":    vs_rhp_slg,
+                    "vs_LHP_slg":    vs_lhp_slg,
                     "barrel_rate":   barrel,
                     "flyball_rate":  flyball,
                     "hard_hit_rate": hard_hit,
                     "pull_rate":     pull,
                     "oppo_rate":     oppo,
-                    "hr_rate":       0.035,
+                    "hr_rate":       float(row.get("HR", 0) or 0) / max(float(row.get("PA", 1) or 1), 1),
                 }
-            # Set the split-specific SLG
-            out[key][slg_key] = slg
-            # Average the profile stats if we already have one side
-            for stat, val in [("barrel_rate", barrel), ("flyball_rate", flyball),
-                               ("hard_hit_rate", hard_hit), ("pull_rate", pull),
-                               ("oppo_rate", oppo)]:
-                out[key][stat] = (out[key][stat] + val) / 2
+            except Exception as e:
+                log.debug("Batter row error: %s", e)
+                continue
 
-    _ingest(vs_rhp, "vs_RHP_slg")
-    _ingest(vs_lhp, "vs_LHP_slg")
     return out
 
 
-def _build_pitcher_dict(
-    vs_rhb: pd.DataFrame,
-    vs_lhb: pd.DataFrame,
-) -> dict:
-    """
-    Build pitcher dicts with split HR/9 vs RHB and vs LHB.
-    HR/9 = (HR allowed / IP) * 9
-    """
+# ── Pitcher stats ─────────────────────────────────────────────────────────────
+
+def _fetch_all_pitcher_stats() -> dict:
+    try:
+        from pybaseball import pitching_stats
+        df = pitching_stats(datetime.date.today().year, qual=10)
+        log.info("FanGraphs pitching: %d rows", len(df))
+        return _build_pitcher_dict(df) if df is not None else {}
+    except Exception as exc:
+        log.warning("FanGraphs pitching fetch failed: %s", exc)
+        return {}
+
+
+def _build_pitcher_dict(df: pd.DataFrame) -> dict:
     out: dict[str, dict] = {}
-
-    def _hr9(row) -> float:
-        hrs = _col(row, _HR_COLS, 0)
-        ip  = _ip_to_float(row.get("p_formatted_ip", row.get("ip", row.get("IP", 1))))
-        return round((hrs / max(ip, 0.33)) * 9, 3)
-
-    def _ingest(df: pd.DataFrame, hr9_key: str) -> None:
-        if df.empty:
-            return
-        for _, row in df.iterrows():
-            name = _name_from_row(row)
+    if df.empty:
+        return out
+    for _, row in df.iterrows():
+        try:
+            name = str(row.get("Name", "")).strip()
+            if not name:
+                continue
             key  = _player_key(name)
-            hr9  = _hr9(row)
-            hand = str(row.get("p_throws", row.get("throws", "R")))
 
-            if key not in out:
-                out[key] = {
-                    "pitcher_id":    key,
-                    "name":          _short_name(name),
-                    "hand":          hand,
-                    "hr_per_9":      hr9,
-                    "hr_per_9_vs_L": 1.35,
-                    "hr_per_9_vs_R": 1.35,
-                }
-            out[key][hr9_key] = hr9
-            out[key]["hr_per_9"] = (out[key].get("hr_per_9", hr9) + hr9) / 2
+            # FanGraphs HR9 column is "HR/9"
+            hr9  = float(row.get("HR/9", 1.35) or 1.35)
+            hand = str(row.get("throws", row.get("Throws", "R"))).strip().upper()
+            if hand not in ("L", "R"):
+                hand = "R"
 
-    _ingest(vs_rhb, "hr_per_9_vs_R")
-    _ingest(vs_lhb, "hr_per_9_vs_L")
+            # Apply platoon multipliers: pitcher hand × batter hand
+            plat = _PLATOON_HR9.get(hand, _PLATOON_HR9["R"])
+            out[key] = {
+                "pitcher_id":    key,
+                "name":          _short_name(name),
+                "hand":          hand,
+                "hr_per_9":      hr9,
+                "hr_per_9_vs_R": round(hr9 * plat["R"], 3),
+                "hr_per_9_vs_L": round(hr9 * plat["L"], 3),
+            }
+        except Exception as e:
+            log.debug("Pitcher row error: %s", e)
+            continue
     return out
 
 
@@ -440,19 +341,19 @@ def _fetch_all_weather(games: list[dict]) -> dict:
         park      = _stadiums.STADIUMS.get(home_abbr, {})
         lat, lon  = park.get("lat"), park.get("lon")
 
-        if home_abbr in _stadiums.DOME_PARKS or lat is None:
-            weather[gid] = _dome_weather() if home_abbr in _stadiums.DOME_PARKS else _neutral_weather()
-            continue
-
-        weather[gid] = _fetch_wttr(lat, lon)
-        time.sleep(0.3)
-
+        if home_abbr in _stadiums.DOME_PARKS:
+            weather[gid] = _dome_weather()
+        elif lat is None:
+            weather[gid] = _neutral_weather()
+        else:
+            weather[gid] = _fetch_wttr(lat, lon)
+            time.sleep(0.3)
     return weather
 
 
 def _fetch_wttr(lat: float, lon: float) -> dict:
     try:
-        r = requests.get(WTTR_URL.format(lat=lat, lon=lon), timeout=8, headers=_SAVANT_HEADERS)
+        r = requests.get(WTTR_URL.format(lat=lat, lon=lon), timeout=8, headers=_HEADERS)
         r.raise_for_status()
         cond = r.json()["current_condition"][0]
         return {
@@ -477,12 +378,25 @@ def _dome_weather() -> dict:
             "wind_direction": "CALM", "conditions": "Dome"}
 
 
-# ── Player key / name helpers ─────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _safe_float(row, cols: list[str], default: float) -> float:
+    if not hasattr(row, "get") and not hasattr(row, "__getitem__"):
+        return default
+    for c in cols:
+        try:
+            v = row[c] if hasattr(row, "__getitem__") else getattr(row, c, None)
+            if v is not None and pd.notna(v):
+                return float(v)
+        except Exception:
+            continue
+    return default
+
 
 def _player_key(name: str) -> str:
     return (name.lower()
             .replace(" ", "_").replace(".", "").replace("'", "")
-            .replace("-", "_").replace(",", ""))
+            .replace("-", "_").replace(",", "").replace("  ", "_"))
 
 
 def _short_name(full: str) -> str:
@@ -490,7 +404,7 @@ def _short_name(full: str) -> str:
     return f"{parts[0][0]}. {' '.join(parts[1:])}" if len(parts) >= 2 else full
 
 
-# ── Stub registries (populated during lineup fetch) ───────────────────────────
+# ── Stub registries ───────────────────────────────────────────────────────────
 
 _BATTER_REGISTRY:  dict[str, dict] = {}
 _PITCHER_REGISTRY: dict[str, dict] = {}
@@ -523,10 +437,10 @@ def _ensure_pitcher_stub(key: str, name: str, hand: str) -> None:
 def build_rows(data: dict) -> list[dict]:
     rows = []
     for game in data["games"]:
-        gid     = game["game_id"]
-        park    = data["parks"].get(game["park_id"])
+        gid    = game["game_id"]
+        park   = data["parks"].get(game["park_id"])
         if park is None:
-            log.warning("No park entry for %s — skipping %s", game["park_id"], gid)
+            log.warning("No park for %s, skipping %s", game["park_id"], gid)
             continue
         weather = data["weather"].get(gid, _neutral_weather())
         lineup  = data["lineups"].get(gid, {})
