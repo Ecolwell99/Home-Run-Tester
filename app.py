@@ -323,7 +323,7 @@ if view == "Ranked Cards":
 
 # ── Raw Table view ────────────────────────────────────────────────────────────
 
-else:
+elif view == "Raw Table":
     if df.empty:
         st.warning("No batters match the current filters.")
     else:
